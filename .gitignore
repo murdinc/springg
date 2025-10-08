@@ -1,0 +1,38 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+springg
+builds/
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Vendor
+vendor/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files
+*.bin
+*.meta
+*.wal
+springg_data/
+
+# Temporary
+*.tmp

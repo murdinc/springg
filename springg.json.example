@@ -1,0 +1,15 @@
+{
+  "port": 8080,
+  "jwt_secret": "CHANGE-THIS-TO-A-LONG-RANDOM-SECRET-IN-PRODUCTION",
+  "require_jwt": true,
+  "dimensions": 1024,
+  "data_path": "/var/lib/springg",
+  "log_level": "info",
+  "max_vectors_per_index": 100000,
+  "persistence_interval": "5m",
+  "s3_bucket": "my-springg-vectors-backup",
+  "s3_region": "us-east-1",
+  "s3_sync_interval": "5m",
+  "cluster_enabled": true,
+  "cluster_bind_port": 7946
+}
