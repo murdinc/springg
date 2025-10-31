@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/murdinc/springg/internal/springg"
+	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/spf13/cobra"
 )
 
@@ -28,6 +30,9 @@ var (
 	s3Syncer           *springg.S3Syncer
 	clusterManager     *springg.ClusterManager
 	replicationManager *springg.ReplicationManager
+	requestMetrics     *RequestMetrics
+	cpuMonitor         *CPUMonitor
+	bulkRequestSem     chan struct{} // Semaphore for limiting concurrent bulk requests
 )
 
 var serveCmd = &cobra.Command{
@@ -70,6 +75,20 @@ var serveCmd = &cobra.Command{
 		vectorStore = store
 		log.Printf("Memory limit: %d MB", config.MaxMemoryMB)
 
+		// Initialize request metrics
+		requestMetrics = NewRequestMetrics()
+		requestMetrics.Start()
+
+		// Initialize CPU monitor
+		cpuMonitor = NewCPUMonitor()
+		cpuMonitor.Start()
+
+		// Initialize bulk request semaphore
+		if config.MaxConcurrentBulkRequests > 0 {
+			bulkRequestSem = make(chan struct{}, config.MaxConcurrentBulkRequests)
+			log.Printf("🚦 Bulk request concurrency limit: %d", config.MaxConcurrentBulkRequests)
+		}
+
 		// Log loaded indexes
 		indexes := vectorStore.ListIndexes()
 		log.Printf("Loaded %d indexes from disk", len(indexes))
@@ -80,13 +99,24 @@ var serveCmd = &cobra.Command{
 
 		// Initialize cluster manager if enabled
 		var cluster *springg.ClusterManager
+		var nodeID string
 		if config.ClusterEnabled {
 			cluster, err = springg.NewClusterManager(context.Background(), vectorStore, config.ClusterBindPort)
 			if err != nil {
 				log.Printf("⚠️  Failed to initialize cluster manager: %v", err)
 			} else {
 				clusterManager = cluster
+				nodeID = cluster.GetNodeID()
 				log.Printf("🌐 Cluster manager initialized")
+
+				// Update vector count in gossip state for loaded indexes
+				cluster.UpdateVectorCount(vectorStore)
+				// Write initial S3 heartbeat to confirm connectivity
+				if s3Syncer != nil {
+					if err := s3Syncer.WriteHeartbeat(context.Background(), nodeID); err != nil {
+						log.Printf("⚠️  Failed to write S3 heartbeat: %v", err)
+					}
+				}
 			}
 		}
 
@@ -95,10 +125,15 @@ var serveCmd = &cobra.Command{
 			replicationManager = springg.NewReplicationManager(cluster, vectorStore)
 			log.Printf("🔄 Replication manager initialized")
 
-			// Reconcile indexes with peers after a brief delay (let cluster stabilize)
+			// Initial reconciliation attempt if peers are already available
 			go func() {
 				time.Sleep(10 * time.Second)
-				cluster.ReconcileAllIndexes(context.Background(), vectorStore)
+				if cluster.GetClusterSize() > 1 {
+					log.Printf("🔄 Initial reconciliation with %d peers", cluster.GetClusterSize()-1)
+					cluster.ReconcileAllIndexes(context.Background(), vectorStore)
+				} else {
+					log.Printf("ℹ️  No peers at startup (reconciliation will auto-trigger when nodes join)")
+				}
 			}()
 		}
 
@@ -109,6 +144,7 @@ var serveCmd = &cobra.Command{
 		r.Use(middleware.RequestID)
 		r.Use(middleware.RealIP)
 		r.Use(loggerMiddleware)
+		r.Use(requestCounterMiddleware) // Track request metrics
 		r.Use(middleware.Recoverer)
 		r.Use(middleware.Timeout(60 * time.Second)) // 60s request timeout
 		r.Use(middleware.SetHeader("Content-Type", "application/json"))
@@ -137,30 +173,36 @@ var serveCmd = &cobra.Command{
 			// Health check (no auth required)
 			r.Get("/health", handleHealth)
 
-			// Apply JWT middleware if required
-			if config.RequireJWT {
-				r.Use(jwtMiddleware(config.JWTSecret))
-			}
+			// Protected routes group with JWT middleware
+			r.Group(func(r chi.Router) {
+				// Apply JWT middleware if required
+				if config.RequireJWT {
+					r.Use(jwtMiddleware(config.JWTSecret))
+				}
 
-			// Index management
-			r.Post("/indexes/{name}", handleCreateIndex)
-			r.Delete("/indexes/{name}", handleDeleteIndex)
-			r.Get("/indexes", handleListIndexes)
-			r.Get("/indexes/{name}/stats", handleIndexStats)
+				// Index management
+				r.Post("/indexes/{name}", handleCreateIndex)
+				r.Delete("/indexes/{name}", handleDeleteIndex)
+				r.Get("/indexes", handleListIndexes)
+				r.Get("/indexes/{name}/stats", handleIndexStats)
 
-			// Vector operations
-			r.Post("/indexes/{name}/vectors", handleAddVector)
-			r.Post("/indexes/{name}/vectors/bulk", handleBulkAddVectors)
-			r.Get("/indexes/{name}/vectors/{id}", handleGetVector)
-			r.Put("/indexes/{name}/vectors/{id}", handleUpdateVector)
-			r.Delete("/indexes/{name}/vectors/{id}", handleDeleteVector)
-			r.Post("/indexes/{name}/search", handleSearch)
+				// Vector operations
+				r.Post("/indexes/{name}/vectors", handleAddVector)
+				r.Post("/indexes/{name}/vectors/bulk", handleBulkAddVectors)
+				r.Get("/indexes/{name}/vectors/{id}", handleGetVector)
+				r.Put("/indexes/{name}/vectors/{id}", handleUpdateVector)
+				r.Delete("/indexes/{name}/vectors/{id}", handleDeleteVector)
+				r.Post("/indexes/{name}/search", handleSearch)
+			})
 		})
 
 		// Internal endpoints (no auth, for cluster replication)
 		r.Route("/internal", func(r chi.Router) {
 			r.Post("/replicate", handleReplication)
 			r.Get("/cluster/status", handleClusterStatus)
+
+			// Index list for reconciliation (no auth)
+			r.Get("/indexes", handleListIndexes)
 
 			// Block-based sync endpoints
 			r.Get("/sync/{index}/manifest", handleGetManifest)
@@ -248,6 +290,112 @@ var serveCmd = &cobra.Command{
 
 func init() {
 	serveCmd.Flags().IntVar(&port, "port", 0, "Port to listen on (overrides config file)")
+}
+
+// RequestMetrics tracks request rates using a sliding window
+type RequestMetrics struct {
+	buckets    [60]uint64 // One bucket per second for last 60 seconds
+	currentSec int64      // Current second index
+	mu         sync.RWMutex
+}
+
+func NewRequestMetrics() *RequestMetrics {
+	return &RequestMetrics{}
+}
+
+func (rm *RequestMetrics) Start() {
+	// Background goroutine to rotate buckets every second
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			rm.mu.Lock()
+			now := time.Now().Unix()
+			rm.currentSec = now
+			// Clear the bucket for this second (wraps around every 60 seconds)
+			rm.buckets[now%60] = 0
+			rm.mu.Unlock()
+		}
+	}()
+}
+
+func (rm *RequestMetrics) Increment() {
+	rm.mu.Lock()
+	now := time.Now().Unix()
+	rm.buckets[now%60]++
+	rm.mu.Unlock()
+}
+
+func (rm *RequestMetrics) GetQPS() map[string]float64 {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	// Sum all 60 buckets for requests per minute
+	var totalLastMinute uint64
+	for _, count := range rm.buckets {
+		totalLastMinute += count
+	}
+
+	// Calculate QPS (average over last 60 seconds)
+	qps := float64(totalLastMinute) / 60.0
+
+	return map[string]float64{
+		"last_minute": qps,
+		"total":       float64(totalLastMinute),
+	}
+}
+
+// CPUMonitor tracks CPU usage percentage using gopsutil
+type CPUMonitor struct {
+	currentCPU float64
+	mu         sync.RWMutex
+}
+
+func NewCPUMonitor() *CPUMonitor {
+	return &CPUMonitor{}
+}
+
+func (cm *CPUMonitor) Start() {
+	// Update CPU stats every 2 seconds
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			cm.update()
+		}
+	}()
+}
+
+func (cm *CPUMonitor) update() {
+	// Get CPU usage percentage averaged over 1 second
+	// percpu=false means total CPU usage across all cores
+	percentages, err := cpu.Percent(time.Second, false)
+	if err != nil {
+		log.Printf("⚠️  Failed to get CPU usage: %v", err)
+		return
+	}
+
+	if len(percentages) > 0 {
+		cm.mu.Lock()
+		cm.currentCPU = percentages[0]
+		cm.mu.Unlock()
+	}
+}
+
+func (cm *CPUMonitor) GetCPUPercent() float64 {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.currentCPU
+}
+
+// requestCounterMiddleware increments the request counter
+func requestCounterMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requestMetrics != nil {
+			requestMetrics.Increment()
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // loggerMiddleware logs HTTP requests
@@ -379,6 +527,11 @@ func handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Replicate index creation to peers if clustering enabled
+	if replicationManager != nil {
+		replicationManager.ReplicateCreateIndex(context.Background(), name, req.Dimensions)
+	}
+
 	respondSuccess(w, map[string]interface{}{
 		"name":       name,
 		"dimensions": req.Dimensions,
@@ -397,6 +550,24 @@ func handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 			respondError(w, err.Error(), http.StatusInternalServerError)
 		}
 		return
+	}
+
+	// Delete from S3 if enabled
+	if s3Syncer != nil {
+		ctx := context.Background()
+		if err := s3Syncer.DeleteIndex(ctx, name); err != nil {
+			log.Printf("⚠️  Failed to delete index from S3: %v", err)
+		}
+	}
+
+	// Replicate index deletion to peers if clustering enabled
+	if replicationManager != nil {
+		replicationManager.ReplicateDeleteIndex(context.Background(), name)
+	}
+
+	// Update vector count in cluster state
+	if clusterManager != nil {
+		clusterManager.UpdateVectorCount(vectorStore)
 	}
 
 	respondSuccess(w, map[string]interface{}{
@@ -487,6 +658,11 @@ func handleAddVector(w http.ResponseWriter, r *http.Request) {
 		replicationManager.ReplicateAdd(context.Background(), name, req.ID, req.Vector, req.Metadata)
 	}
 
+	// Update vector count in cluster state
+	if clusterManager != nil {
+		clusterManager.UpdateVectorCount(vectorStore)
+	}
+
 	respondSuccess(w, map[string]interface{}{
 		"id":    req.ID,
 		"added": true,
@@ -574,9 +750,86 @@ func handleDeleteVector(w http.ResponseWriter, r *http.Request) {
 		replicationManager.ReplicateDelete(context.Background(), name, id)
 	}
 
+	// Update vector count in cluster state
+	if clusterManager != nil {
+		clusterManager.UpdateVectorCount(vectorStore)
+	}
+
 	respondSuccess(w, map[string]interface{}{
 		"id":      id,
 		"deleted": true,
+	})
+}
+
+// RecencyBoost defines parameters for date-based score boosting
+type RecencyBoost struct {
+	Field            string  `json:"field"`              // "published_date" or "modified_date"
+	RecentDays       int     `json:"recent_days"`        // Tier 1 threshold (e.g., 90 days)
+	RecentMultiplier float64 `json:"recent_multiplier"`  // Boost for tier 1 (e.g., 1.5)
+	MediumDays       int     `json:"medium_days"`        // Tier 2 threshold (e.g., 365 days)
+	MediumMultiplier float64 `json:"medium_multiplier"`  // Boost for tier 2 (e.g., 1.2)
+}
+
+// applyRecencyBoost applies date-based score boosting and re-sorts results
+func applyRecencyBoost(results []springg.SearchResult, boost *RecencyBoost) {
+	now := time.Now()
+	recentDuration := time.Duration(boost.RecentDays) * 24 * time.Hour
+	mediumDuration := time.Duration(boost.MediumDays) * 24 * time.Hour
+
+	// Apply multipliers to each result
+	for i := range results {
+		multiplier := 1.0
+
+		// Extract date from metadata
+		if results[i].Metadata != nil {
+			var dateStr string
+			if boost.Field == "published_date" {
+				if val, ok := results[i].Metadata["published_date"].(string); ok {
+					dateStr = val
+				}
+			} else if boost.Field == "modified_date" {
+				if val, ok := results[i].Metadata["modified_date"].(string); ok {
+					dateStr = val
+				}
+			}
+
+			// Parse date and calculate age
+			if dateStr != "" {
+				// Try multiple date formats
+				var docDate time.Time
+				var err error
+
+				// Try RFC3339 first (ISO 8601)
+				docDate, err = time.Parse(time.RFC3339, dateStr)
+				if err != nil {
+					// Try common MySQL datetime format
+					docDate, err = time.Parse("2006-01-02 15:04:05", dateStr)
+				}
+				if err != nil {
+					// Try date-only format
+					docDate, err = time.Parse("2006-01-02", dateStr)
+				}
+
+				if err == nil {
+					age := now.Sub(docDate)
+
+					// Apply two-tier multiplier
+					if age < recentDuration {
+						multiplier = boost.RecentMultiplier
+					} else if age < mediumDuration {
+						multiplier = boost.MediumMultiplier
+					}
+				}
+			}
+		}
+
+		// Apply multiplier to score
+		results[i].Score = results[i].Score * multiplier
+	}
+
+	// Re-sort by boosted scores (highest first)
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
 	})
 }
 
@@ -585,8 +838,9 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
 	var req struct {
-		Vector []float32 `json:"vector"`
-		K      int       `json:"k"`
+		Vector       []float32      `json:"vector"`
+		K            int            `json:"k"`
+		RecencyBoost *RecencyBoost  `json:"recency_boost,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -623,6 +877,11 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply recency boosting if requested
+	if req.RecencyBoost != nil {
+		applyRecencyBoost(results, req.RecencyBoost)
+	}
+
 	respondSuccess(w, results)
 }
 
@@ -656,6 +915,28 @@ func handleGetVector(w http.ResponseWriter, r *http.Request) {
 
 // Bulk add vectors handler
 func handleBulkAddVectors(w http.ResponseWriter, r *http.Request) {
+	// CPU backpressure: reject request if CPU is too high
+	if config.BulkCPUThresholdPercent > 0 && cpuMonitor != nil {
+		currentCPU := cpuMonitor.GetCPUPercent()
+		if currentCPU > config.BulkCPUThresholdPercent {
+			w.Header().Set("Retry-After", "5")
+			respondError(w, fmt.Sprintf("Server overloaded (CPU: %.1f%%), please retry", currentCPU), http.StatusTooManyRequests)
+			return
+		}
+	}
+
+	// Semaphore: limit concurrent bulk requests
+	if bulkRequestSem != nil {
+		select {
+		case bulkRequestSem <- struct{}{}:
+			defer func() { <-bulkRequestSem }()
+		default:
+			w.Header().Set("Retry-After", "2")
+			respondError(w, "Too many concurrent bulk requests, please retry", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	name := chi.URLParam(r, "name")
 
 	var req struct {
@@ -713,12 +994,22 @@ func handleBulkAddVectors(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Replicate successful adds to peers if clustering enabled
+		if replicationManager != nil {
+			replicationManager.ReplicateAdd(context.Background(), name, entry.ID, entry.Vector, entry.Metadata)
+		}
+
 		successCount++
 	}
 
 	// Force flush after bulk operation
 	if err := index.Flush(); err != nil {
 		log.Printf("Failed to flush index after bulk add: %v", err)
+	}
+
+	// Update vector count in cluster state
+	if clusterManager != nil && successCount > 0 {
+		clusterManager.UpdateVectorCount(vectorStore)
 	}
 
 	result := map[string]interface{}{
@@ -759,6 +1050,11 @@ func handleReplication(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Update vector count after replication
+		if clusterManager != nil && len(batch.Messages) > len(errors) {
+			clusterManager.UpdateVectorCount(vectorStore)
+		}
+
 		if len(errors) > 0 {
 			log.Printf("⚠️  Batch replication had %d errors", len(errors))
 			respondSuccess(w, map[string]interface{}{
@@ -784,6 +1080,11 @@ func handleReplication(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Update vector count after replication
+		if clusterManager != nil {
+			clusterManager.UpdateVectorCount(vectorStore)
+		}
+
 		respondSuccess(w, map[string]bool{"replicated": true})
 	}
 }
@@ -797,10 +1098,28 @@ func handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 
 	peerStates := clusterManager.GetPeerStates()
 
-	respondSuccess(w, map[string]interface{}{
-		"cluster_size": clusterManager.GetClusterSize(),
-		"peers":        peerStates,
-		"memory":       vectorStore.GetMemoryStats(),
+	// Update the responding node's last_seen to current time since it's actively responding
+	nodeID := clusterManager.GetNodeID()
+	if localState, exists := peerStates[nodeID]; exists {
+		localState.LastSeen = time.Now()
+	}
+
+	status := map[string]interface{}{
+		"responding_node": nodeID,
+		"cluster_size":    clusterManager.GetClusterSize(),
+		"peers":           peerStates,
+		"memory":          vectorStore.GetMemoryStats(),
+		"qps":             requestMetrics.GetQPS(),
+	}
+
+	// Pretty print the JSON response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(apiResponse{
+		Status: "success",
+		Data:   status,
 	})
 }
 

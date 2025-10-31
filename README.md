@@ -1,13 +1,6 @@
 # Springg Vector Database
 
-A production-ready, distributed vector database written in Go with advanced features for scalability and reliability. Designed for deployment on AWS with automatic clustering, crash recovery, and peer-to-peer replication.
-
-**Key Highlights:**
-- **100x-1000x faster search** with HNSW (Hierarchical Navigable Small World) indexing
-- **Zero data loss** with Write-Ahead Logging for crash recovery
-- **Auto-scaling architecture** built for AWS EC2 Auto Scaling Groups
-- **Efficient replication** with batching that reduces HTTP requests by 100x
-- **Smart S3 sync** with block-based incremental updates reducing data transfer by 1000x
+A high-performance, distributed vector database written in Go, designed for production deployment on AWS with automatic clustering, S3 backup, and peer-to-peer replication.
 
 ## Features
 
@@ -19,7 +12,7 @@ A production-ready, distributed vector database written in Go with advanced feat
 - **RESTful HTTP API** - Simple JSON API for all operations
 
 ### Performance & Reliability (v2.0)
-- **HNSW Index** - Hierarchical Navigable Small World graph for 100x-1000x faster ANN search
+- **Brute Force Search** - Exact nearest neighbor search for accurate results
 - **Write-Ahead Log** - Crash recovery with zero data loss
 - **Async Persistence** - Non-blocking saves with automatic batching
 - **Async Replication** - Batched replication reduces HTTP requests by 100x
@@ -27,11 +20,15 @@ A production-ready, distributed vector database written in Go with advanced feat
 - **Memory Management** - Configurable limits with accurate tracking
 - **Rate Limiting** - 100 req/s per IP protection against DoS
 - **Request Timeouts** - 60s timeout prevents indefinite blocking
+- **CPU Backpressure** - Real-time CPU monitoring with automatic request rejection
+- **Bulk Request Limiting** - Configurable concurrent bulk operations to prevent overload
 
 ### Clustering & Distribution
 - **Auto-Scaling Ready** - Designed for AWS EC2 Auto Scaling Groups
 - **P2P Clustering** - Automatic peer discovery and gossip-based state synchronization
-- **Real-time Replication** - Vector operations replicate across all cluster nodes instantly
+- **Real-time Replication** - Index and vector operations replicate across all cluster nodes instantly
+- **Index Replication** - Index creation/deletion automatically propagates to all peers
+- **Auto-Reconciliation** - New/restarted nodes automatically sync missing indexes and vectors from peers
 - **Coordinated S3 Sync** - Only one node syncs to S3 per interval to avoid conflicts
 - **Graceful Shutdown** - Clean resource cleanup on termination
 
@@ -80,8 +77,9 @@ A production-ready, distributed vector database written in Go with advanced feat
 - **EC2 Auto-Detection** - Automatically detects ASG membership via IMDSv2
 - **Peer Discovery** - Finds other instances in the same Auto Scaling Group
 - **State Broadcasting** - Shares vector counts and sync times across cluster
+- **Auto-Reconciliation** - Syncs missing indexes and vectors on startup (10s delay)
 - **Smart S3 Sync** - Coordinates to ensure only one node syncs at a time
-- **HTTP Replication** - Vector operations replicate to all peers (port 8080)
+- **HTTP Replication** - Index and vector operations replicate to all peers (port 8080)
 
 ## Installation
 
@@ -113,12 +111,15 @@ Edit `springg.json`:
   "data_path": "/var/lib/springg",
   "log_level": "info",
   "max_vectors_per_index": 100000,
+  "max_memory_mb": 2048,
   "persistence_interval": "5m",
   "s3_bucket": "my-springg-backup",
   "s3_region": "us-east-1",
   "s3_sync_interval": "5m",
   "cluster_enabled": true,
-  "cluster_bind_port": 7946
+  "cluster_bind_port": 7946,
+  "max_concurrent_bulk_requests": 2,
+  "bulk_cpu_threshold_percent": 80.0
 }
 ```
 
@@ -203,6 +204,8 @@ Authorization: Bearer <your-jwt-token>
 }
 ```
 
+**Clustering:** If clustering is enabled, this operation automatically replicates to all peer nodes.
+
 **cURL Example:**
 ```bash
 curl -X POST http://localhost:8080/api/indexes/articles \
@@ -280,6 +283,8 @@ curl http://localhost:8080/api/indexes/articles/stats \
   }
 }
 ```
+
+**Clustering:** Automatically replicates to all peer nodes.
 
 **cURL Example:**
 ```bash
@@ -397,6 +402,86 @@ curl -X POST http://localhost:8080/api/indexes/articles/vectors \
       }
     ]
   }
+}
+```
+
+**Overload Protection (HTTP 429):**
+
+Bulk requests are protected by two mechanisms to prevent server overload:
+
+1. **Concurrent Request Limiting** - Controlled by `max_concurrent_bulk_requests`
+2. **CPU Backpressure** - Controlled by `bulk_cpu_threshold_percent`
+
+When limits are exceeded, the server returns `HTTP 429 Too Many Requests`:
+
+```json
+{
+  "status": "error",
+  "error": "Server overloaded (CPU: 85.3%), please retry"
+}
+```
+
+Or:
+
+```json
+{
+  "status": "error",
+  "error": "Too many concurrent bulk requests, please retry"
+}
+```
+
+The response includes a `Retry-After` header (in seconds) indicating when to retry:
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 5
+```
+
+**Client Retry Logic:**
+
+```python
+import time
+
+def bulk_add_with_retry(vectors, max_retries=5):
+    for attempt in range(max_retries):
+        response = requests.post(url, json={"vectors": vectors})
+
+        if response.status_code == 200:
+            return response.json()
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 5))
+            backoff = retry_after * (2 ** attempt)
+            time.sleep(backoff)
+            continue
+
+        raise Exception(f"Unexpected status: {response.status_code}")
+
+    raise Exception("Max retries exceeded")
+```
+
+**Configuration Tuning:**
+
+For high-throughput bulk indexing:
+```json
+{
+  "max_concurrent_bulk_requests": 3,
+  "bulk_cpu_threshold_percent": 70.0
+}
+```
+
+For low CPU usage on shared servers:
+```json
+{
+  "max_concurrent_bulk_requests": 1,
+  "bulk_cpu_threshold_percent": 50.0
+}
+```
+
+To disable protection (not recommended):
+```json
+{
+  "max_concurrent_bulk_requests": 0,
+  "bulk_cpu_threshold_percent": 0
 }
 ```
 
@@ -622,7 +707,7 @@ curl -X POST http://localhost:8080/api/indexes/articles/search \
 }
 ```
 
-**Operations:** `add`, `update`, `delete`
+**Operations:** `add`, `update`, `delete`, `create_index`, `delete_index`
 
 **Response:**
 ```json
@@ -770,7 +855,15 @@ systemctl start springg
 4. **State Sync:** Shares node state (vector count, last S3 sync time)
 5. **S3 Download:** Downloads existing indexes from S3 on startup
 6. **Replication Ready:** Starts receiving replication messages on port 8080
-7. **S3 Coordination:** Participates in election to determine which node syncs to S3
+7. **Auto-Reconciliation:** After 10s, syncs missing indexes and vectors from peers
+8. **S3 Coordination:** Participates in election to determine which node syncs to S3
+
+**When an index is created:**
+1. Client → ALB → Node A (receives request)
+2. Node A creates index locally
+3. Node A sends replication message to Node B and Node C
+4. Node B and Node C create the index locally
+5. All nodes now have the same index
 
 **When a vector is added:**
 1. Client → ALB → Node A (receives request)
@@ -824,12 +917,15 @@ Tested on AWS t3.medium (2 vCPU, 4GB RAM):
 | `data_path` | string | `/tmp/springg_data` | Directory for binary storage |
 | `log_level` | string | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `max_vectors_per_index` | int | 100000 | Maximum vectors per index |
+| `max_memory_mb` | int | 2048 | Maximum memory in MB (0 = unlimited) |
 | `persistence_interval` | string | `5m` | How often to flush to disk |
 | `s3_bucket` | string | - | S3 bucket name (empty = S3 disabled) |
 | `s3_region` | string | `us-east-1` | AWS region for S3 |
 | `s3_sync_interval` | string | `5m` | How often to sync to S3 |
 | `cluster_enabled` | bool | true | Enable P2P clustering |
 | `cluster_bind_port` | int | 7946 | Port for gossip protocol |
+| `max_concurrent_bulk_requests` | int | 2 | Max concurrent bulk operations (0 = unlimited) |
+| `bulk_cpu_threshold_percent` | float | 80.0 | Reject bulk requests if CPU exceeds this % (0 = no limit) |
 
 ---
 
@@ -893,6 +989,15 @@ curl http://localhost:8080/internal/cluster/status
 - Verify `/internal/cluster/status` shows all nodes
 - Check logs for "⚠️ Replication error"
 - Ensure all nodes have the same JWT secret
+- Verify all nodes are running the same version of Springg
+
+**Problem:** Indexes missing on some nodes
+
+**Solution:**
+- Indexes sync automatically 10 seconds after joining cluster
+- Check logs for "📥 Creating missing index" messages
+- Restart the node to trigger reconciliation
+- Verify port 8080 is open between nodes for reconciliation API calls
 
 ### S3 Sync Issues
 
@@ -1010,77 +1115,23 @@ MIT License - see LICENSE file for details
 
 ---
 
-## Technical Details
-
-### Implementation Highlights
-
-**HNSW Index (`internal/springg/hnsw.go`)**
-- Hierarchical graph structure with configurable `M` (connections) and `efConstruction` parameters
-- Layer-based search from coarse to fine granularity
-- Bidirectional links with pruning for optimal graph structure
-- Thread-safe with RWMutex for concurrent reads
-
-**Write-Ahead Log (`internal/springg/wal.go`)**
-- JSON-based log entries for add/update/delete operations
-- Automatic replay on startup for crash recovery
-- Buffered writes with sync to disk for durability
-- Truncation after successful checkpoints
-
-**Async Replication (`internal/springg/replication.go`)**
-- Non-blocking channel-based batching queue (1000 message buffer)
-- Periodic batch sends to reduce network overhead
-- HTTP connection pooling for efficiency
-- Graceful degradation on queue overflow
-
-**S3 Sync (`internal/springg/s3sync.go`)**
-- Block-based incremental uploads (only changed blocks)
-- Coordinated sync (only one node per interval)
-- Automatic download on cluster join
-- AWS SDK v2 with configurable regions
-
-### Architecture Decisions
-
-- **Go** for performance, concurrency, and AWS SDK support
-- **In-memory indexes** for sub-millisecond search latency
-- **Binary storage format** with custom `SPRINGG1` format (4x faster than JSON)
-- **Separate metadata files** (`.meta`) for human readability
-- **Gossip protocol** (HashiCorp Memberlist) for cluster membership
-- **RESTful HTTP** for broad client compatibility
-
 ## Support
 
 For issues and questions:
 - GitHub Issues: https://github.com/murdinc/springg/issues
 - Documentation: https://github.com/murdinc/springg/wiki
 
-## Author
-
-Created by [murdinc](https://github.com/murdinc) - A distributed systems project demonstrating production-grade Go development with AWS integration.
-
 ---
 
-## Project Status
+## Roadmap
 
-**Current Version: v2.0** - Production-ready with advanced indexing and reliability features
-
-### Completed Features ✅
-- **HNSW Index** - Hierarchical Navigable Small World graph for ANN search (100x-1000x speedup)
-- **Write-Ahead Log** - Crash recovery with zero data loss guarantee
-- **Async Replication** - Batched peer-to-peer replication (100x fewer HTTP requests)
-- **Block-based S3 Sync** - Incremental sync reduces data transfer by 1000x
-- **Memory Management** - Configurable limits with accurate tracking
-- **Rate Limiting** - 100 req/s per IP protection
-- **Request Timeouts** - 60s timeout prevents blocking
-- **P2P Clustering** - Auto-discovery via HashiCorp Memberlist gossip protocol
-- **JWT Authentication** - HS256 signed tokens for API security
-- **RESTful API** - Complete JSON API with bulk operations
-
-### Roadmap
-- [ ] Quantization support (int8, binary vectors)
-- [ ] gRPC API for lower latency
+- [x] Write-Ahead Log for crash recovery (✅ Implemented in v2.0)
+- [x] Async replication batching (✅ Implemented in v2.0)
+- [x] Block-based S3 sync (✅ Implemented in v2.0)
+- [ ] Quantization support (int8, binary)
+- [ ] gRPC API
 - [ ] Prometheus metrics endpoint
-- [ ] Circuit breaker for replication resilience
-- [ ] Metadata filtering in vector search
+- [ ] Circuit breaker for replication
+- [ ] Vector filtering by metadata
 - [ ] Multi-region replication
 - [ ] Backup/restore CLI commands
-- [ ] HNSW index persistence to disk
