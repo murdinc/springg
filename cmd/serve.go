@@ -867,7 +867,17 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := index.Search(req.Vector, req.K)
+	// If recency boost is enabled, fetch more results to allow proper re-ranking
+	searchK := req.K
+	if req.RecencyBoost != nil {
+		// Fetch 10x more results to ensure recent articles have a chance to be boosted into top-K
+		searchK = req.K * 10
+		if searchK > 1000 {
+			searchK = 1000 // Cap at 1000 to avoid performance issues
+		}
+	}
+
+	results, err := index.Search(req.Vector, searchK)
 	if err != nil {
 		if strings.Contains(err.Error(), "dimension mismatch") {
 			respondError(w, err.Error(), http.StatusBadRequest)
@@ -880,6 +890,10 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	// Apply recency boosting if requested
 	if req.RecencyBoost != nil {
 		applyRecencyBoost(results, req.RecencyBoost)
+		// Limit to requested K after boosting and re-sorting
+		if len(results) > req.K {
+			results = results[:req.K]
+		}
 	}
 
 	respondSuccess(w, results)
